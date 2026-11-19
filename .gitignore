@@ -1,5 +1,24 @@
+# Environment and sensitive keys (CRITICAL for your Gmail app)
 .env
 !.env.example
-.venv
 credentials.json
 token.json
+*.db
+*.db-*
+
+# Editor files
+.vscode/
+.vscode/settings.json
+
+# Tools Config
+*.devdbrc
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/

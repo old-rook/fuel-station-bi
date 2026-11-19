@@ -1,457 +1,216 @@
 """
 gmail_service.py
 ----------------
-Implements FR-1: Gmail Inbox Ingestion & Extraction for Fuel Station Sales Reports.
+Gmail Inbox Ingestion & Extraction for Fuel Station Sales Reports.
 
 Features:
-- FR-1.1: OAuth 2.0 authentication with Gmail readonly scope (and optional send scope).
-- FR-1.2: On-demand sync execution ('Sync Inbox Now') and cron-compatible trigger.
-- FR-1.3: Deduplication by unique Gmail message_id using persistent storage (SQLite by default).
-- FR-1.4: Extraction of sale_date, branch_name, fuel_product, volume_sold, revenue_amount, currency.
-- FR-1.5: Filtering non-sales emails (promos, receipts, newsletters) without cluttering review queues.
+- Headless / non-interactive OAuth2 & Service Account authentication with secure token storage (0600).
+- Atomic SQLite transactions with WAL mode, foreign keys, and idempotency guarantees.
+- Safe MIME traversal with base64 padding normalization and HTML tag stripping.
+- Resilient line-by-line heuristic parser and CSV reader supporting negative values.
+- Explicit validation: records lacking dates or station identifiers are routed to an exception state
+  rather than silently populated with fallback defaults.
+- Gmail API pagination handling with configurable search queries.
 """
 
-import base64
-import csv
-import io
 import json
 import logging
 import os
-import re
+import random
+import time
 import sqlite3
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from api.utils.html_helper import strip_html
+from api.utils.ingestion import IngestionStore
+from api.utils.emails import SalesDataExtractor, SalesEmailClassifier
+from api.utils.util import safe_b64decode
+from api.models.gmail_datamodels import SyncSummary
 
 # Google API Client Libraries
 try:
     from google.auth.transport.requests import Request
+    from google.oauth2 import service_account
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import Resource, build
     from googleapiclient.errors import HttpError
 
 except ImportError:
-    # Allows module inspection or mock-testing even if google libs are not installed yet
     Credentials = None  # type: ignore
+    service_account = None  # type: ignore
     InstalledAppFlow = None  # type: ignore
     Resource = None  # type: ignore
     build = None  # type: ignore
     HttpError = Exception  # type: ignore
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Scopes: Read-only for ingestion; send is optional for notification workflows
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-]
+# -----------------------------------------------------------------------------
+# Configuration Constants (Environment-Overridable)
+# -----------------------------------------------------------------------------
 
-DEFAULT_TOKEN_FILE = os.getenv("GMAIL_TOKEN_PATH", "token.json")
-DEFAULT_CREDENTIALS_FILE = os.getenv("GMAIL_CREDENTIALS_PATH", "credentials.json")
-DEFAULT_DB_FILE = os.getenv("APP_DB_PATH", "fuel_sales.db")
+SCOPES: Sequence[str] = ["https://www.googleapis.com/auth/gmail.readonly"]
+
+DEFAULT_TOKEN_FILE = os.getenv("GMAIL_TOKEN_PATH", os.path.abspath("token.json"))
+DEFAULT_CREDENTIALS_FILE = os.getenv("GMAIL_CREDENTIALS_PATH", os.path.abspath("credentials.json"))
+DEFAULT_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+DEFAULT_GMAIL_QUERY = os.getenv("GMAIL_SEARCH_QUERY", "in:inbox")
+DEFAULT_DB_FILE = os.getenv("APP_DB_PATH", os.path.abspath("fuel_sales.db"))
 
 
 # -----------------------------------------------------------------------------
-# Data Models
-# -----------------------------------------------------------------------------
-
-@dataclass
-class FuelSaleRecord:
-    sale_date: str          # Format: YYYY-MM-DD
-    branch_name: str        # e.g., "North Highway Station", "Downtown Branch", can use branch code if available.
-    fuel_product: str       # e.g., "Unleaded", "Diesel", "Premium", "E10"
-    volume_sold: float      # in Liters
-    revenue_amount: float   # total amount sold
-    raw_message_id: str     # Gmail message ID for traceability
-    currency: str = "PHP"   #  "PHP"
-
-
-@dataclass
-class SyncSummary:
-    timestamp: str
-    total_messages_found: int
-    processed_count: int
-    ignored_count: int
-    already_synced_count: int
-    extracted_records_count: int
-    records: List[FuelSaleRecord]
-    errors: List[str]
-
-
-# -----------------------------------------------------------------------------
-# Storage / Deduplication Helper (SQLite-backed)
-# -----------------------------------------------------------------------------
-
-class IngestionStore:
-    """Manages processed Gmail message IDs and extracted records for deduplication."""
-
-    def __init__(self, db_path: str = DEFAULT_DB_FILE):
-        self.db_path = db_path
-        self._init_db()
-
-    def _get_connection(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path)
-
-    def _init_db(self) -> None:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            # Table to guarantee FR-1.3 deduplication
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS processed_emails (
-                    message_id TEXT PRIMARY KEY,
-                    processed_at TEXT NOT NULL,
-                    subject TEXT,
-                    sender TEXT,
-                    is_sales_report INTEGER NOT NULL
-                )
-            """)
-            # Table for extracted fuel sales data
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS fuel_sales (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    message_id TEXT NOT NULL,
-                    sale_date TEXT NOT NULL,
-                    branch_name TEXT NOT NULL,
-                    fuel_product TEXT NOT NULL,
-                    volume_sold REAL NOT NULL,
-                    revenue_amount REAL NOT NULL,
-                    currency TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY (message_id) REFERENCES processed_emails(message_id)
-                )
-            """)
-            conn.commit()
-
-    def is_message_processed(self, message_id: str) -> bool:
-        """FR-1.3: Check if email has already been ingested."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM processed_emails WHERE message_id = ?", (message_id,))
-            return cursor.fetchone() is not None
-
-    def record_processed_email(self, message_id: str, subject: str, sender: str, is_sales_report: bool) -> None:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT OR IGNORE INTO processed_emails (message_id, processed_at, subject, sender, is_sales_report)
-                VALUES (?, ?, ?, ?, ?)
-            """, (message_id, datetime.now(timezone.utc).isoformat(), subject, sender, int(is_sales_report)))
-            conn.commit()
-
-    def save_sales_records(self, records: List[FuelSaleRecord]) -> None:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            now = datetime.now(timezone.utc).isoformat()
-            cursor.executemany("""
-                INSERT INTO fuel_sales (message_id, sale_date, branch_name, fuel_product, volume_sold, revenue_amount, currency, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, [
-                (r.raw_message_id, r.sale_date, r.branch_name, r.fuel_product, r.volume_sold, r.revenue_amount, r.currency, now)
-                for r in records
-            ])
-            conn.commit()
-
-
-# -----------------------------------------------------------------------------
-# FR-1.5: Non-Sales Filter & Classifier
-# -----------------------------------------------------------------------------
-
-class SalesEmailClassifier:
-    """Detects whether an incoming email is a valid station sales report."""
-
-    SALES_KEYWORDS = {
-        "sales", "fuel", "daily report", "end of day", "eod", "meter reading",
-        "volume", "liters", "litres", "gallons", "shift report", "pump", "reconciliation"
-    }
-
-    IGNORE_KEYWORDS = {
-        "newsletter", "unsubscribe", "promotion", "marketing", "webinar",
-        "discount", "order confirmation", "otp", "verify your account", "password reset"
-    }
-
-    FUEL_PRODUCTS = ["unleaded", "regular", "diesel", "premium", "v-power", "e10", "autogas", "lpg"]
-
-    @classmethod
-    def is_sales_email(cls, subject: str, body: str, sender: str) -> bool:
-        combined = f"{subject} {body}".lower()
-
-        # Check explicit ignore keywords first
-        if any(ign in combined for ign in cls.IGNORE_KEYWORDS):
-            return False
-
-        # Look for sales indicators
-        has_sales_kw = any(kw in combined for kw in cls.SALES_KEYWORDS)
-        has_fuel_kw = any(fuel in combined for fuel in cls.FUEL_PRODUCTS)
-
-        return has_sales_kw and has_fuel_kw
-
-
-# -----------------------------------------------------------------------------
-# FR-1.4: Extraction Engine
-# -----------------------------------------------------------------------------
-
-class SalesDataExtractor:
-    """Extracts sale_date, branch_name, fuel_product, volume, revenue, currency."""
-
-    # Recognized fuel products normalizer
-    PRODUCT_MAPPING = {
-        "unleaded": "Unleaded",
-        "regular": "Unleaded",
-        "diesel": "Diesel",
-        "gasoil": "Diesel",
-        "premium": "Premium",
-        "v-power": "Premium",
-        "super": "Premium",
-        "e10": "E10",
-        "lpg": "LPG"
-    }
-
-    CURRENCY_SYMBOLS = {
-        "$": "USD",
-        "€": "EUR",
-        "£": "GBP",
-        "₱": "PHP",
-        "¥": "JPY",
-        "A$": "AUD",
-        "C$": "CAD"
-    }
-
-    @staticmethod
-    def extract_date(text: str) -> str:
-        # Match YYYY-MM-DD, DD/MM/YYYY, MM/DD/YYYY, or Month DD, YYYY
-        patterns = [
-            r"\b(20\d{2}[-/](?:0[1-9]|1[0-2])[-/](?:0[1-9]|[12]\d|3[01]))\b",
-            r"\b((?:0[1-9]|[12]\d|3[01])[-/.](?:0[1-9]|1[0-2])[-/.](?:20\d{2}))\b",
-            r"\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+20\d{2})\b"
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                raw_date = match.group(1).replace("/", "-").replace(".", "-")
-                try:
-                    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m-%d-%Y", "%B %d, %Y", "%b %d, %Y"):
-                        try:
-                            return datetime.strptime(raw_date.replace(",", ""), fmt).strftime("%Y-%m-%d")
-                        except ValueError:
-                            continue
-                except Exception:
-                    pass
-        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    @staticmethod
-    def extract_branch(text: str, default: str = "Main Branch") -> str:
-        # Match "Branch: North Station" or "Station: Downtown #101"
-        branch_match = re.search(r"(?:Branch|Station|Location|Site)\s*[:#-]?\s*([A-Za-z0-9\s\-]+?)(?:\r?\n|,|$)", text, re.IGNORECASE)
-        if branch_match:
-            candidate = branch_match.group(1).strip()
-            if len(candidate) > 2 and len(candidate) < 60:
-                return candidate
-        return default
-
-    @classmethod
-    def extract_records(cls, text: str, attachments_data: List[str], message_id: str) -> List[FuelSaleRecord]:
-        """
-        Extracts sales line items from text and attached CSVs.
-        Handles tabular/key-value representations.
-        """
-        records: List[FuelSaleRecord] = []
-        full_text = text + "\n" + "\n".join(attachments_data)
-
-        sale_date = cls.extract_date(full_text)
-        branch_name = cls.extract_branch(full_text)
-
-        # Detect currency
-        currency = "USD"
-        for symbol, code in cls.CURRENCY_SYMBOLS.items():
-            if symbol in full_text:
-                currency = code
-                break
-        code_match = re.search(r"\b(USD|EUR|GBP|PHP|CAD|AUD|NZD)\b", full_text, re.IGNORECASE)
-        if code_match:
-            currency = code_match.group(1).upper()
-
-        # 1. Attempt parsing CSV attachments first if present
-        for attach in attachments_data:
-            if "," in attach:
-                csv_records = cls._parse_csv_content(attach, sale_date, branch_name, currency, message_id)
-                records.extend(csv_records)
-
-        if records:
-            return records
-
-        # 2. Heuristic line-by-line / regex parsing for unstructured body text
-        # Pattern examples:
-        # Unleaded: 1,500.50 L - $4,501.50
-        # Diesel Sold: 2000 Liters | Total: $6000.00
-        for raw_name, std_name in cls.PRODUCT_MAPPING.items():
-            pattern = rf"(?i)\b{raw_name}\b.*?(\d[\d,]*\.?\d*)\s*(?:l|liters|litres|gal|gallons)?.*?[\$€£₱]?\s*(\d[\d,]*\.?\d*)"
-            match = re.search(pattern, full_text)
-            if match:
-                try:
-                    vol = float(match.group(1).replace(",", ""))
-                    rev = float(match.group(2).replace(",", ""))
-                    if vol > 0 or rev > 0:
-                        records.append(FuelSaleRecord(
-                            sale_date=sale_date,
-                            branch_name=branch_name,
-                            fuel_product=std_name,
-                            volume_sold=vol,
-                            revenue_amount=rev,
-                            currency=currency,
-                            raw_message_id=message_id
-                        ))
-                except (ValueError, IndexError):
-                    continue
-
-        return records
-
-    @classmethod
-    def _parse_csv_content(cls, csv_text: str, default_date: str, default_branch: str, default_curr: str, message_id: str) -> List[FuelSaleRecord]:
-        results: List[FuelSaleRecord] = []
-        try:
-            reader = csv.DictReader(io.StringIO(csv_text))
-            if not reader.fieldnames:
-                return results
-
-            # Normalize headers
-            headers = {h.strip().lower(): h for h in reader.fieldnames if h}
-            product_col = next((headers[h] for h in headers if "product" in h or "fuel" in h), None)
-            volume_col = next((headers[h] for h in headers if "vol" in h or "liter" in h or "quantity" in h), None)
-            revenue_col = next((headers[h] for h in headers if "rev" in h or "amount" in h or "total" in h or "sales" in h), None)
-            date_col = next((headers[h] for h in headers if "date" in h), None)
-            branch_col = next((headers[h] for h in headers if "branch" in h or "station" in h), None)
-
-            if product_col and (volume_col or revenue_col):
-                for row in reader:
-                    prod_val = row.get(product_col, "").strip()
-                    norm_prod = None
-                    for key, mapped in cls.PRODUCT_MAPPING.items():
-                        if key in prod_val.lower():
-                            norm_prod = mapped
-                            break
-                    if not norm_prod:
-                        continue
-
-                    def clean_float(val: Optional[str]) -> float:
-                        if not val:
-                            return 0.0
-                        cleaned = re.sub(r"[^\d.]", "", val)
-                        try:
-                            return float(cleaned)
-                        except ValueError:
-                            return 0.0
-
-                    vol = clean_float(row.get(volume_col)) if volume_col else 0.0
-                    rev = clean_float(row.get(revenue_col)) if revenue_col else 0.0
-                    s_date = row.get(date_col).strip() if date_col and row.get(date_col) else default_date
-                    s_branch = row.get(branch_col).strip() if branch_col and row.get(branch_col) else default_branch
-
-                    results.append(FuelSaleRecord(
-                        sale_date=s_date,
-                        branch_name=s_branch,
-                        fuel_product=norm_prod,
-                        volume_sold=vol,
-                        revenue_amount=rev,
-                        currency=default_curr,
-                        raw_message_id=message_id
-                    ))
-        except Exception as err:
-            logger.warning(f"Error parsing CSV attachment: {err}")
-        return results
-
-
-# -----------------------------------------------------------------------------
-# FR-1.1 & FR-1.2: Gmail Service Client & Ingestion Runner
+# Gmail Client & Sync Runner
 # -----------------------------------------------------------------------------
 
 class GmailService:
-    """Manages OAuth 2.0 connection, inbox fetching, deduplication, and extraction."""
+    """Robust OAuth2 and Service Account Gmail Ingestion Service."""
 
     def __init__(
         self,
         credentials_file: str = DEFAULT_CREDENTIALS_FILE,
         token_file: str = DEFAULT_TOKEN_FILE,
+        service_account_file: str = DEFAULT_SERVICE_ACCOUNT_FILE,
         db_path: str = DEFAULT_DB_FILE
     ):
         self.credentials_file = credentials_file
         self.token_file = token_file
+        self.service_account_file = service_account_file
         self.store = IngestionStore(db_path=db_path)
         self.service: Optional[Resource] = None
 
-    def authenticate(self) -> Resource:
-        """FR-1.1: Connect securely using OAuth 2.0 with gmail.readonly scope."""
+    def authenticate(self, allow_browser_login: bool = False) -> Resource:
+        """
+        Authenticates securely.
+        1. Checks for Service Account credentials (ideal for cron/backend).
+        2. Checks for pre-authorized user token and refreshes non-interactively.
+        3. Fails securely if running headless without authorization rather than hanging.
+        """
+        if build is None:
+            raise RuntimeError("Google API client libraries are not installed.")
+
         creds = None
+
+        # 1. Service Account Flow
+        if self.service_account_file and os.path.exists(self.service_account_file):
+            logger.info("Authenticating via Google Service Account.")
+            creds = service_account.Credentials.from_service_account_file(
+                self.service_account_file, scopes=SCOPES
+            )
+            self.service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+            return self.service
+
+        # 2. User OAuth2 Token Flow
         if os.path.exists(self.token_file):
             creds = Credentials.from_authorized_user_file(self.token_file, SCOPES)
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                logger.info("Refreshing expired Gmail OAuth token...")
+                logger.info("Refreshing expired OAuth token non-interactively...")
                 creds.refresh(Request())
+                self._save_token_securely(creds)
             else:
-                if not os.path.exists(self.credentials_file):
-                    raise FileNotFoundError(
-                        f"OAuth client secrets file '{self.credentials_file}' not found. "
-                        "Download it from Google Cloud Console."
+                if not allow_browser_login:
+                    raise PermissionError(
+                        "No valid OAuth token found and interactive login is disabled in headless mode. "
+                        "Pre-generate token.json or configure service account credentials."
                     )
-                logger.info("Initiating OAuth 2.0 browser authorization flow...")
+                if not os.path.exists(self.credentials_file):
+                    raise FileNotFoundError(f"Missing OAuth client secret at '{self.credentials_file}'")
+
+                logger.info("Launching local OAuth flow (interactive)...")
                 flow = InstalledAppFlow.from_client_secrets_file(self.credentials_file, SCOPES)
                 creds = flow.run_local_server(port=0)
+                self._save_token_securely(creds)
 
-            # Persist token for subsequent runs
-            with open(self.token_file, "w") as token:
-                token.write(creds.to_json())
-
-        self.service = build("gmail", "v1", credentials=creds)
-        logger.info("Successfully authenticated with Gmail API.")
+        self.service = build("gmail", "v1", credentials=creds, cache_discovery=False)
         return self.service
 
+    def _save_token_securely(self, creds: Credentials) -> None:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        mode = 0o600  # Read/Write only for owner
+        token_dir = os.path.dirname(self.token_file)
+        if token_dir:
+            os.makedirs(token_dir, exist_ok=True)
+        fd = os.open(self.token_file, flags, mode)
+        with open(fd, "w") as f:
+            f.write(creds.to_json())
+
     def _extract_body_and_attachments(self, payload: Dict[str, Any], message_id: str) -> Tuple[str, List[str]]:
-        """Traverses MIME message payload to retrieve body text and CSV attachments."""
-        body_text = ""
+        plain_parts: List[str] = []
+        html_parts: List[str] = []
         csv_attachments: List[str] = []
 
-        def recurse_parts(part: Dict[str, Any]):
-            nonlocal body_text
-            mime_type = part.get("mimeType", "")
+        def recurse(part: Dict[str, Any]) -> None:
+            mime = part.get("mimeType", "")
             data = part.get("body", {}).get("data")
             filename = part.get("filename", "")
+            att_id = part.get("body", {}).get("attachmentId")
 
-            # If part has inline base64 text
-            if data and ("text/plain" in mime_type or "text/html" in mime_type):
-                decoded = base64.urlsafe_b64decode(data.encode("ASCII")).decode("utf-8", errors="replace")
-                body_text += "\n" + decoded
+            if mime == "text/plain" and data:
+                plain_parts.append(safe_b64decode(data))
+            elif mime == "text/html" and data:
+                html_parts.append(safe_b64decode(data))
 
-            # Check for CSV attachment
             if filename.lower().endswith(".csv"):
-                attachment_id = part.get("body", {}).get("attachmentId")
-                if attachment_id and self.service:
+                if att_id and self.service:
                     try:
-                        att_res = self.service.users().messages().attachments().get(
-                            userId="me", messageId=message_id, id=attachment_id
-                        ).execute()
-                        att_data = att_res.get("data", "")
+                        req = self.service.users().messages().attachments().get(
+                            userId="me", messageId=message_id, id=att_id
+                        )
+                        res = self.execute_with_backoff(req)
+                        att_data = res.get("data", "")
                         if att_data:
-                            decoded_csv = base64.urlsafe_b64decode(att_data.encode("ASCII")).decode("utf-8", errors="replace")
-                            csv_attachments.append(decoded_csv)
-                    except Exception as err:
-                        logger.error(f"Failed to fetch attachment {attachment_id}: {err}")
+                            csv_attachments.append(safe_b64decode(att_data))
+                    except HttpError as err:
+                        logger.error(f"Failed to fetch attachment {att_id} in msg {message_id}: {err}")
                 elif data:
-                    decoded_csv = base64.urlsafe_b64decode(data.encode("ASCII")).decode("utf-8", errors="replace")
-                    csv_attachments.append(decoded_csv)
+                    csv_attachments.append(safe_b64decode(data))
 
             for subpart in part.get("parts", []):
-                recurse_parts(subpart)
+                recurse(subpart)
 
-        recurse_parts(payload)
+        recurse(payload)
+
+        # Prioritize text/plain; fall back to stripped HTML
+        body_text = "\n".join(plain_parts) if plain_parts else strip_html("\n".join(html_parts))
         return body_text, csv_attachments
 
-    def sync_inbox(self, max_results: int = 50) -> SyncSummary:
+    @staticmethod
+    def execute_with_backoff(request, max_retries: int = 5):
         """
-        FR-1.2: Core ingestion method.
-        Callable from scheduled cron job or on-demand via 'Sync Inbox Now' UI button.
+        Executes a Google API request with exponential backoff and jitter
+        to handle 429 and 403 rate limit / quota errors.
+        """
+        for attempt in range(max_retries):
+            try:
+                return request.execute()
+            except HttpError as err:
+                # 429 = Too Many Requests; 403 with rateLimitExceeded/userRateLimitExceeded
+                is_rate_limit = err.resp.status in (429, 500, 503) or (
+                    err.resp.status == 403 and any(
+                        r.get("reason") in ("rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded")
+                        for r in getattr(err, "error_details", [])
+                        or [{"reason": "rateLimitExceeded"}]
+                    )
+                )
+
+                if is_rate_limit and attempt < max_retries - 1:
+                    # Exponential backoff formula: (2 ^ attempt) + jitter
+                    sleep_seconds = (2 ** attempt) + random.uniform(0.5, 1.5)
+                    logger.warning(
+                        f"Gmail quota limit hit. Retrying in {sleep_seconds:.2f}s "
+                        f"(attempt {attempt + 1}/{max_retries})..."
+                    )
+                    time.sleep(sleep_seconds)
+                else:
+                    raise
+
+    def sync_inbox(self, max_total_messages: int = 20, query: str = DEFAULT_GMAIL_QUERY) -> SyncSummary:
+        """
+        Executes ingestion with pagination and deduplication.
         """
         if not self.service:
             self.authenticate()
@@ -463,26 +222,53 @@ class GmailService:
             ignored_count=0,
             already_synced_count=0,
             extracted_records_count=0,
+            quarantined_count=0,
             records=[],
             errors=[]
         )
 
         try:
-            # Fetch recent messages from Inbox, update with my query (possibly list of senders or subject filters?)
-            response = self.service.users().messages().list(userId="me", maxResults=max_results, q="in:inbox").execute()
-            messages = response.get("messages", [])
-            summary.total_messages_found = len(messages)
+            # 1. Fetch message references with pagination
+            message_ids: List[str] = []
+            page_token = None
 
-            for msg_meta in messages:
-                msg_id = msg_meta["id"]
+            while len(message_ids) < max_total_messages:
+                batch_size = min(50, max_total_messages - len(message_ids))
+                req = self.service.users().messages().list(
+                    userId="me",
+                    maxResults=batch_size,
+                    q=query,
+                    pageToken=page_token
+                )
+                res = self.execute_with_backoff(req)
 
-                # FR-1.3: Deduplication check
+                messages = res.get("messages", [])
+                if not messages:
+                    break
+
+                for m in messages:
+                    message_ids.append(m["id"])
+
+                page_token = res.get("nextPageToken")
+                if not page_token:
+                    break
+
+            summary.total_messages_found = len(message_ids)
+
+            # 2. Process messages
+            for msg_id in message_ids:
                 if self.store.is_message_processed(msg_id):
                     summary.already_synced_count += 1
                     continue
 
                 try:
-                    msg = self.service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+                    # Add a 100ms pause to smooth out quota spikes
+                    time.sleep(0.1)
+
+                    msg_req = self.service.users().messages().get(
+                        userId="me", id=msg_id, format="full"
+                    )
+                    msg = self.execute_with_backoff(msg_req)
                     payload = msg.get("payload", {})
                     headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
                     subject = headers.get("subject", "")
@@ -490,67 +276,86 @@ class GmailService:
 
                     body_text, csv_attachments = self._extract_body_and_attachments(payload, msg_id)
 
-                    # FR-1.5: Ignore non-sales emails
-                    if not SalesEmailClassifier.is_sales_email(subject, body_text, sender):
-                        self.store.record_processed_email(msg_id, subject, sender, is_sales_report=False)
+                    # Filter non-sales emails
+                    if not SalesEmailClassifier.is_sales_email(subject, body_text):
+                        self.store.persist_email_and_records(
+                            message_id=msg_id,
+                            subject=subject,
+                            sender=sender,
+                            status="IGNORED",
+                            is_sales_report=False,
+                            records=[]
+                        )
                         summary.ignored_count += 1
                         continue
 
-                    # FR-1.4: Extract sales metrics
+                    # Extract line items
                     records = SalesDataExtractor.extract_records(body_text, csv_attachments, msg_id)
 
-                    # Record email as processed
-                    self.store.record_processed_email(msg_id, subject, sender, is_sales_report=True)
+                    if not records:
+                        # Email matched sales criteria but failed date/branch/product validation
+                        self.store.persist_email_and_records(
+                            message_id=msg_id,
+                            subject=subject,
+                            sender=sender,
+                            status="QUARANTINED",
+                            is_sales_report=True,
+                            records=[]
+                        )
+                        summary.quarantined_count += 1
+                        continue
 
-                    if records:
-                        self.store.save_sales_records(records)
-                        summary.records.extend(records)
-                        summary.extracted_records_count += len(records)
-
+                    # Persist atomically
+                    self.store.persist_email_and_records(
+                        message_id=msg_id,
+                        subject=subject,
+                        sender=sender,
+                        status="PROCESSED",
+                        is_sales_report=True,
+                        records=records
+                    )
                     summary.processed_count += 1
+                    summary.records.extend(records)
+                    summary.extracted_records_count += len(records)
 
+                except sqlite3.DatabaseError as db_err:
+                    err_msg = f"Database error on msg_id={msg_id}: {db_err}"
+                    logger.exception(err_msg)
+                    summary.errors.append(err_msg)
                 except Exception as msg_err:
-                    err_msg = f"Error processing message {msg_id}: {str(msg_err)}"
-                    logger.error(err_msg)
+                    err_msg = f"Unexpected processing error on msg_id={msg_id}: {msg_err}"
+                    logger.exception(err_msg)
                     summary.errors.append(err_msg)
 
-        except Exception as e:
-            err_msg = f"Failed to list or sync Gmail messages: {str(e)}"
+        except HttpError as api_err:
+            err_msg = f"Gmail API error: {api_err}"
             logger.error(err_msg)
             summary.errors.append(err_msg)
 
-        logger.info(
-            f"Sync complete. Found: {summary.total_messages_found}, "
-            f"Already Synced: {summary.already_synced_count}, "
-            f"Processed: {summary.processed_count}, "
-            f"Ignored: {summary.ignored_count}, "
-            f"Records Saved: {summary.extracted_records_count}"
-        )
         return summary
 
 
 # -----------------------------------------------------------------------------
-# Trigger Endpoints & Cron Runner
+# Trigger Endpoints
 # -----------------------------------------------------------------------------
 
-def run_scheduled_cron():
-    """FR-1.2: Entry point executed automatically once per day via cron scheduler."""
-    logger.info("Executing daily scheduled inbox sync...")
+def run_scheduled_cron() -> SyncSummary:
+    """Cron entry point (strictly headless)."""
     service = GmailService()
-    summary = service.sync_inbox()
-    return summary
+    service.authenticate(allow_browser_login=False)
+    return service.sync_inbox()
 
 
 def sync_inbox_now() -> Dict[str, Any]:
-    """FR-1.2: Entry point for the UI 'Sync Inbox Now' button."""
+    """Interactive / UI trigger endpoint."""
     service = GmailService()
     summary = service.sync_inbox()
-    # Return JSON-serializable dictionary for UI/API consumption
     return {
         "timestamp": summary.timestamp,
         "total_messages_found": summary.total_messages_found,
         "processed_count": summary.processed_count,
         "ignored_count": summary.ignored_count,
+        "quarantined_count": summary.quarantined_count,
         "already_synced_count": summary.already_synced_count,
         "extracted_records_count": summary.extracted_records_count,
         "errors": summary.errors,
@@ -559,7 +364,6 @@ def sync_inbox_now() -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    import sys
-    print("Running Gmail Ingestion Service...")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     res = sync_inbox_now()
     print(json.dumps(res, indent=2))
