@@ -468,7 +468,7 @@ class GmailService:
         )
 
         try:
-            # Fetch recent messages from Inbox
+            # Fetch recent messages from Inbox, update with my query (possibly list of senders or subject filters?)
             response = self.service.users().messages().list(userId="me", maxResults=max_results, q="in:inbox").execute()
             messages = response.get("messages", [])
             summary.total_messages_found = len(messages)
